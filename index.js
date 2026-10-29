@@ -40,6 +40,12 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+app.get('/api/dashboard', (req, res) => {
+  return res.status(501).json({
+    error: 'Sports data API is not connected yet.',
+  });
+});
+
 app.listen(port, () => {
   console.log(`API server listening on port ${port}`);
 });

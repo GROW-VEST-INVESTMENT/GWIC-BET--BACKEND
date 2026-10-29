@@ -24,3 +24,7 @@
 
 The health endpoint reports success only when MongoDB responds to a ping.
 Never add database credentials to frontend or `VITE_` variables.
+
+`GET /api/dashboard` currently returns HTTP `501` to indicate that no sports
+data provider is connected yet. Replace this explicit unavailable response
+with a route backed by a real provider before returning fixtures or odds.
