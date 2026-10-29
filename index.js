@@ -10,7 +10,20 @@ const mongoClient = process.env.MONGODB_URI
   ? new MongoClient(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 })
   : null;
 
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173' }));
+const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`Origin ${origin} is not allowed by CORS`));
+  },
+}));
 app.use(express.json());
 
 app.get('/api/health', async (req, res) => {
