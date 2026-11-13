@@ -8,6 +8,9 @@ const LinkedBankAccount = require('../models/LinkedBankAccount');
 const { paystackRequest, verifyWebhookSignature } = require('../services/paystack');
 const { createJournal } = require('../services/coreSavings');
 const { getOrCreateWallet } = require('../services/wallet');
+const { isAllowedMobilePaymentCallback } = require('../services/mobilePaymentCallback');
+const { sendNotificationEmailInBackground } = require('../services/resendMailer');
+const Notification = require('../models/Notification');
 
 const MINIMUM_KOBO = 10000;
 const MAXIMUM_DEPOSIT_KOBO = 100000000;
@@ -20,12 +23,22 @@ function normalizeAccountName(value) {
 
 async function creditVerifiedDeposit(transaction) {
   const session = await mongoose.startSession();
+  let creditedUser;
+  let depositDetails;
   try {
     await session.withTransaction(async () => {
       const current = await WalletTransaction.findById(transaction._id).session(session);
       if (!current || current.status === 'successful') return;
       if (current.status !== 'pending') return;
 
+      creditedUser = await User.findById(current.userId)
+        .select('name email notificationPreferences')
+        .session(session)
+        .lean();
+      depositDetails = {
+        reference: current.reference,
+        amountKobo: current.amountKobo,
+      };
       const wallet = await getOrCreateWallet(current.userId, session);
       wallet.balanceKobo += current.amountKobo;
       await wallet.save({ session });
@@ -42,9 +55,29 @@ async function creditVerifiedDeposit(transaction) {
       });
       current.status = 'successful';
       await current.save({ session });
+      await Notification.create([{
+        userId: current.userId,
+        title: 'Deposit confirmed',
+        message: `Your wallet deposit of ₦${(current.amountKobo / 100).toLocaleString('en-NG')} was confirmed successfully.`,
+        category: 'Transactions',
+        type: 'success',
+        icon: 'wallet',
+        color: 'green',
+        amount: `₦${(current.amountKobo / 100).toLocaleString('en-NG')}`,
+      }], { session });
     });
   } finally {
     await session.endSession();
+  }
+  if (creditedUser && depositDetails) {
+    const amount = (depositDetails.amountKobo / 100).toLocaleString('en-NG');
+    sendNotificationEmailInBackground(creditedUser, {
+      preference: 'emailAccountUpdates',
+      event: 'deposit_confirmed',
+      subject: 'Your Kalma Capital deposit is confirmed',
+      text: `Hello ${creditedUser.name},\n\nYour wallet deposit of ₦${amount} has been confirmed and credited to your wallet.`,
+      idempotencyKey: `deposit-confirmed/${depositDetails.reference}`,
+    });
   }
 }
 
@@ -226,8 +259,12 @@ async function resolveWithdrawalAccount(req, res, next) {
 
 async function initializeDeposit(req, res, next) {
   const amountNaira = req.body?.amount;
+  const mobileCallbackUrl = req.body?.callbackUrl;
   if (!Number.isSafeInteger(amountNaira) || amountNaira * 100 < MINIMUM_KOBO || amountNaira * 100 > MAXIMUM_DEPOSIT_KOBO) {
     return res.status(400).json({ message: 'Deposit between ₦100 and ₦1,000,000.' });
+  }
+  if (mobileCallbackUrl !== undefined && !isAllowedMobilePaymentCallback(mobileCallbackUrl)) {
+    return res.status(400).json({ message: 'The mobile payment return address is invalid.' });
   }
   if (!req.user.email) {
     return res.status(400).json({ message: 'Add an email address to your account before depositing.' });
@@ -237,7 +274,7 @@ async function initializeDeposit(req, res, next) {
   try {
     const reference = `GWIC_DEP_${crypto.randomUUID()}`;
     const frontendUrl = process.env.FRONTEND_URL;
-    if (!frontendUrl) {
+    if (!mobileCallbackUrl && !frontendUrl) {
       return res.status(503).json({ message: 'Payment return address is not configured.' });
     }
     [transaction] = await WalletTransaction.create([{
@@ -254,7 +291,7 @@ async function initializeDeposit(req, res, next) {
         amount: amountNaira * 100,
         currency: 'NGN',
         reference,
-        callback_url: `${frontendUrl.replace(/\/+$/, '')}/dashboard?payment=paystack`,
+        callback_url: mobileCallbackUrl || `${frontendUrl.replace(/\/+$/, '')}/dashboard?payment=paystack`,
         metadata: { user_id: req.user.id, purpose: 'wallet_deposit' },
       }),
     });

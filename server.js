@@ -13,7 +13,12 @@ const coreSavingsRoutes = require('./routes/coreSavingsRoutes');
 const walletRoutes = require('./routes/walletRoutes');
 const accountRoutes = require('./routes/accountRoutes');
 const accountReviewRoutes = require('./routes/accountReviewRoutes');
+const notificationsRoutes = require('./routes/notificationsRoutes');
 const { startCoreSavingsScheduler } = require('./services/coreSavingsScheduler');
+const {
+  isResendTestMode,
+  sendNotificationEmailInBackground,
+} = require('./services/resendMailer');
 const { handlePaystackWebhook } = require('./controllers/walletController');
 
 const app = express();
@@ -44,6 +49,7 @@ app.use('/api/core-savings', coreSavingsRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/account', accountRoutes);
 app.use('/api/account-review', accountReviewRoutes);
+app.use('/api/notifications', notificationsRoutes);
 
 app.get('/', (req, res) => {
   res.json({
@@ -106,13 +112,20 @@ app.post('/api/auth/register', async (req, res, next) => {
   }
 
   try {
-    await User.create({
+    const user = await User.create({
       name: normalizedName,
       email: normalizedEmail,
       phone: normalizedPhone,
       goal,
       product,
       passwordHash: password,
+    });
+    sendNotificationEmailInBackground(user, {
+      preference: 'emailAccountUpdates',
+      event: 'account_created',
+      subject: 'Welcome to Kalma Capital',
+      text: `Hello ${user.name},\n\nYour Kalma Capital account has been created. You can now sign in to manage your account and view your activity.`,
+      idempotencyKey: `account-created/${user.id}`,
     });
     return res.status(201).json({ message: 'Your account has been created.' });
   } catch (error) {
@@ -216,6 +229,9 @@ app.use((error, req, res, next) => {
 });
 
 async function startServer() {
+  if (process.env.NODE_ENV === 'production' && isResendTestMode()) {
+    throw new Error('RESEND_TEST_MODE must not be enabled in production.');
+  }
   if (!process.env.MONGODB_URI) {
     throw new Error('MONGODB_URI is not configured.');
   }
@@ -225,6 +241,9 @@ async function startServer() {
 
   await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
   console.log('MongoDB connected.');
+  if (isResendTestMode()) {
+    console.log('Resend test mode is ON; app notification emails route to RESEND_TEST_TO.');
+  }
   startCoreSavingsScheduler();
   return app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

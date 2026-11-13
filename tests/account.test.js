@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const {
   updateProfile,
   updatePreferences,
+  updateNotificationPreferences,
   createVerificationRequest,
   createSupportRequest,
   createLinkedBank,
@@ -153,6 +154,35 @@ test('account preferences reject unsupported values', async () => {
     const response = makeResponse();
     await updatePreferences({ body }, response, (error) => { throw error; });
     assert.equal(response.statusCode, 400);
+  }
+});
+
+test('notification preferences accept a supported sound and reject invalid sounds', async () => {
+  const originalFindByIdAndUpdate = User.findByIdAndUpdate;
+  let update;
+  User.findByIdAndUpdate = (_userId, changes) => {
+    update = changes;
+    return { select: async () => ({ notificationPreferences: { toObject: () => ({ sound: 'chime' }) } }) };
+  };
+  try {
+    const validResponse = makeResponse();
+    await updateNotificationPreferences(
+      { user: { id: '507f1f77bcf86cd799439011' }, body: { sound: 'chime' } },
+      validResponse,
+      (error) => { throw error; },
+    );
+    assert.equal(validResponse.statusCode, 200);
+    assert.deepEqual(update, { $set: { 'notificationPreferences.sound': 'chime' } });
+
+    const invalidResponse = makeResponse();
+    await updateNotificationPreferences(
+      { body: { sound: 'loud' } },
+      invalidResponse,
+      (error) => { throw error; },
+    );
+    assert.equal(invalidResponse.statusCode, 400);
+  } finally {
+    User.findByIdAndUpdate = originalFindByIdAndUpdate;
   }
 });
 

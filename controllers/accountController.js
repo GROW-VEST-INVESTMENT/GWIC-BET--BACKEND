@@ -7,6 +7,10 @@ const VerificationRequest = require('../models/VerificationRequest');
 const SupportRequest = require('../models/SupportRequest');
 const { paystackRequest } = require('../services/paystack');
 const {
+  isResendConfigured,
+  sendNotificationEmailInBackground,
+} = require('../services/resendMailer');
+const {
   deleteProfilePhoto,
   getProfilePhotoUrl,
   isConfigured,
@@ -14,9 +18,10 @@ const {
 } = require('../services/profilePhotoStorage');
 const { normalizeAccountName } = require('./walletController');
 
-const NOTIFICATION_FIELDS = ['emailAccountUpdates', 'emailSecurityAlerts', 'pushNotifications'];
+const NOTIFICATION_FIELDS = ['emailAccountUpdates', 'emailSecurityAlerts', 'pushNotifications', 'sound'];
 const PREFERENCE_FIELDS = ['hideWalletBalance', 'theme', 'language'];
 const VALID_THEMES = ['system', 'light', 'dark'];
+const VALID_NOTIFICATION_SOUNDS = ['default', 'chime', 'soft', 'silent'];
 const SUPPORT_CATEGORIES = ['account', 'verification', 'payments', 'technical', 'other'];
 
 function sendError(res, status, message) {
@@ -111,7 +116,7 @@ async function updateProfile(req, res, next) {
     const user = await User.findByIdAndUpdate(
       req.user.id,
       { $set: updates },
-      { new: true, runValidators: true },
+      { returnDocument: 'after', runValidators: true },
     ).select('name email phone isKycVerified createdAt +profilePhotoPublicId +profilePhotoVersion');
     if (!user) return sendError(res, 404, 'Account not found.');
     return res.json({
@@ -227,7 +232,7 @@ async function updatePreferences(req, res, next) {
     const user = await User.findByIdAndUpdate(
       req.user.id,
       { $set: updates },
-      { new: true, runValidators: true },
+      { returnDocument: 'after', runValidators: true },
     ).select('accountPreferences');
     if (!user) return sendError(res, 404, 'Account not found.');
     return res.json({ message: 'Your preferences have been saved.', preferences: user.accountPreferences.toObject() });
@@ -242,8 +247,10 @@ async function getNotificationPreferences(req, res, next) {
     if (!user) return sendError(res, 404, 'Account not found.');
     return res.json({
       preferences: user.notificationPreferences.toObject(),
-      delivery: { email: false, push: false },
-      message: 'Your choices are saved. Notification delivery will be available when GWIC connects its messaging providers.',
+      delivery: { email: isResendConfigured(), push: false },
+      message: isResendConfigured()
+        ? 'A Resend API key is configured. Verify the sender and test delivery; push is not configured.'
+        : 'Your choices are saved. Email delivery is not configured on the backend yet.',
     });
   } catch (error) {
     return next(error);
@@ -255,8 +262,13 @@ async function updateNotificationPreferences(req, res, next) {
   if (!Object.keys(body).length || Object.keys(body).some((key) => !NOTIFICATION_FIELDS.includes(key))) {
     return sendError(res, 400, 'Provide one or more supported notification preferences.');
   }
-  if (Object.values(body).some((value) => typeof value !== 'boolean')) {
-    return sendError(res, 400, 'Notification preferences must be true or false.');
+  const invalidPreference = Object.entries(body).some(([key, value]) => (
+    key === 'sound'
+      ? !VALID_NOTIFICATION_SOUNDS.includes(value)
+      : typeof value !== 'boolean'
+  ));
+  if (invalidPreference) {
+    return sendError(res, 400, 'Notification preferences contain an unsupported value.');
   }
 
   const updates = Object.fromEntries(
@@ -266,13 +278,13 @@ async function updateNotificationPreferences(req, res, next) {
     const user = await User.findByIdAndUpdate(
       req.user.id,
       { $set: updates },
-      { new: true, runValidators: true },
+      { returnDocument: 'after', runValidators: true },
     ).select('notificationPreferences');
     if (!user) return sendError(res, 404, 'Account not found.');
     return res.json({
       message: 'Your notification preferences have been saved.',
       preferences: user.notificationPreferences.toObject(),
-      delivery: { email: false, push: false },
+      delivery: { email: isResendConfigured(), push: false },
     });
   } catch (error) {
     return next(error);
@@ -304,6 +316,13 @@ async function changePassword(req, res, next) {
     user.passwordHash = newPassword;
     user.sessionVersion += 1;
     await user.save();
+    sendNotificationEmailInBackground(user, {
+      preference: 'emailSecurityAlerts',
+      event: 'password_changed',
+      subject: 'Your Kalma Capital password was changed',
+      text: `Hello ${user.name},\n\nThe password for your Kalma Capital account was changed. If you did not make this change, contact Kalma Capital support immediately.`,
+      idempotencyKey: `password-changed/${user.id}/${user.sessionVersion}`,
+    });
     res.clearCookie('gwic_session', {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',

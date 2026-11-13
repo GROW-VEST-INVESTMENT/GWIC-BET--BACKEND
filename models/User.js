@@ -26,6 +26,7 @@ const notificationPreferencesSchema = new mongoose.Schema(
     emailAccountUpdates: { type: Boolean, default: true },
     emailSecurityAlerts: { type: Boolean, default: true },
     pushNotifications: { type: Boolean, default: false },
+    sound: { type: String, enum: ['default', 'chime', 'soft', 'silent'], default: 'default' },
   },
   { _id: false },
 );
