@@ -38,6 +38,7 @@ const userSchema = new mongoose.Schema(
     phone: { type: String, trim: true, maxlength: 32, default: '' },
     goal: { type: String, required: true, enum: GOALS },
     product: { type: String, required: true, enum: PRODUCTS },
+    role: { type: String, enum: ['customer', 'staff', 'admin', 'super_admin'], default: 'customer', required: true },
     isKycVerified: { type: Boolean, default: false, required: true },
     accountPreferences: { type: accountPreferencesSchema, default: () => ({}) },
     notificationPreferences: { type: notificationPreferencesSchema, default: () => ({}) },

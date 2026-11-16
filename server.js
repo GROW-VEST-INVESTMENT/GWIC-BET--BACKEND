@@ -6,6 +6,10 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 
 const User = require('./models/User');
+const ConnectCommission = require('./models/ConnectCommission');
+const ConnectPartner = require('./models/ConnectPartner');
+const ConnectPolicy = require('./models/ConnectPolicy');
+const ConnectReferral = require('./models/ConnectReferral');
 const requireAuth = require('./middleware/requireAuth');
 const dashboardRoutes = require('./routes/dashboardRoutes');
 const coreLockRoutes = require('./routes/coreLockRoutes');
@@ -14,6 +18,8 @@ const walletRoutes = require('./routes/walletRoutes');
 const accountRoutes = require('./routes/accountRoutes');
 const accountReviewRoutes = require('./routes/accountReviewRoutes');
 const notificationsRoutes = require('./routes/notificationsRoutes');
+const connectRoutes = require('./routes/connectRoutes');
+const connectAdminRoutes = require('./routes/connectAdminRoutes');
 const { startCoreSavingsScheduler } = require('./services/coreSavingsScheduler');
 const {
   isResendTestMode,
@@ -27,6 +33,9 @@ const getSessionToken = (req) => req.headers.cookie?.split(';').map((part) => pa
   .find((part) => part.startsWith('gwic_session='))?.slice('gwic_session='.length);
 const allowedOrigins = [
   process.env.FRONTEND_URL,
+  process.env.CONNECT_APP_URL,
+  process.env.CONNECT_ADMIN_URL,
+  process.env.ADMIN_URL,
   ...(process.env.CORS_ORIGINS || '').split(','),
   ...(process.env.NODE_ENV !== 'production'
     ? ['http://localhost:5173', 'http://127.0.0.1:5173']
@@ -50,6 +59,8 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/account', accountRoutes);
 app.use('/api/account-review', accountReviewRoutes);
 app.use('/api/notifications', notificationsRoutes);
+app.use('/api/connect', connectRoutes);
+app.use('/api/admin/connect', connectAdminRoutes);
 
 app.get('/', (req, res) => {
   res.json({
@@ -73,7 +84,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 app.post('/api/auth/register', async (req, res, next) => {
-  const { name, email, phone = '', goal, product, password } = req.body || {};
+  const { name, email, phone = '', goal, product, password, promoCode = '' } = req.body || {};
 
   if (
     typeof name !== 'string'
@@ -82,6 +93,7 @@ app.post('/api/auth/register', async (req, res, next) => {
     || typeof goal !== 'string'
     || typeof product !== 'string'
     || typeof password !== 'string'
+    || typeof promoCode !== 'string'
   ) {
     return res.status(400).json({ message: 'Please complete all required fields.' });
   }
@@ -89,6 +101,7 @@ app.post('/api/auth/register', async (req, res, next) => {
   const normalizedName = name.trim().replace(/\s+/g, ' ');
   const normalizedEmail = email.trim().toLowerCase();
   const normalizedPhone = phone.trim();
+  const normalizedPromoCode = promoCode.trim().toUpperCase();
 
   if (
     !normalizedName
@@ -98,6 +111,7 @@ app.post('/api/auth/register', async (req, res, next) => {
     || normalizedPhone.length > 32
     || password.length < 8
     || Buffer.byteLength(password, 'utf8') > 72
+    || (normalizedPromoCode && !/^[A-Z0-9-]{4,24}$/.test(normalizedPromoCode))
     || !User.GOALS.includes(goal)
     || !User.PRODUCTS.includes(product)
   ) {
@@ -112,14 +126,59 @@ app.post('/api/auth/register', async (req, res, next) => {
   }
 
   try {
-    const user = await User.create({
-      name: normalizedName,
-      email: normalizedEmail,
-      phone: normalizedPhone,
-      goal,
-      product,
-      passwordHash: password,
-    });
+    let user;
+    if (!normalizedPromoCode) {
+      user = await User.create({
+        name: normalizedName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        goal,
+        product,
+        passwordHash: password,
+      });
+    } else {
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const partner = await ConnectPartner.findOne({
+            promoCode: normalizedPromoCode,
+            status: 'active',
+          }).session(session);
+          if (!partner) {
+            const error = new Error('That partner promo code is unavailable.');
+            error.status = 400;
+            throw error;
+          }
+          [user] = await User.create([{
+            name: normalizedName,
+            email: normalizedEmail,
+            phone: normalizedPhone,
+            goal,
+            product,
+            passwordHash: password,
+          }], { session });
+          const [referral] = await ConnectReferral.create([{
+            partnerId: partner._id,
+            referredUserId: user._id,
+          }], { session });
+          const policy = await ConnectPolicy.findOne({ key: 'default' }).session(session);
+          if (
+            process.env.CONNECT_COMMISSION_POLICY_APPROVED === 'true'
+            && policy?.registrationRewardEnabled
+            && policy.registrationRewardNaira > 0
+          ) {
+            await ConnectCommission.create([{
+              partnerId: partner._id,
+              referralId: referral._id,
+              type: 'registration',
+              amountKobo: policy.registrationRewardNaira * 100,
+            }], { session });
+          }
+        });
+      } finally {
+        await session.endSession();
+      }
+    }
     sendNotificationEmailInBackground(user, {
       preference: 'emailAccountUpdates',
       event: 'account_created',
@@ -127,7 +186,10 @@ app.post('/api/auth/register', async (req, res, next) => {
       text: `Hello ${user.name},\n\nYour Kalma Capital account has been created. You can now sign in to manage your account and view your activity.`,
       idempotencyKey: `account-created/${user.id}`,
     });
-    return res.status(201).json({ message: 'Your account has been created.' });
+    return res.status(201).json({
+      message: 'Your account has been created.',
+      promoCodeLinked: Boolean(normalizedPromoCode),
+    });
   } catch (error) {
     if (error.code === 11000) {
       return res.status(409).json({ message: 'An account with this email already exists.' });
@@ -178,7 +240,7 @@ app.post('/api/auth/login', async (req, res, next) => {
 
     return res.json({
       message: 'You are now logged in.',
-      user: { id: user.id, name: user.name, email: user.email },
+      user: { id: user.id, name: user.name, email: user.email, role: user.role },
     });
   } catch (error) {
     return next(error);
@@ -187,7 +249,7 @@ app.post('/api/auth/login', async (req, res, next) => {
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
   return res.json({
-    user: { id: req.user.id, name: req.user.name, email: req.user.email },
+    user: { id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role },
   });
 });
 
